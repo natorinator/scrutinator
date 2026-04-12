@@ -1,0 +1,12 @@
+[package]
+name = "scrutinator-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types between scrutinator userspace and eBPF programs"
+
+[features]
+default = []
+user = []
+
+[dependencies]

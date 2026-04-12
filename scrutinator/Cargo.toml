@@ -1,0 +1,24 @@
+[package]
+name = "scrutinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "eBPF system observation library — process, file, and network tracing"
+
+[dependencies]
+scrutinator-common = { workspace = true, features = ["user"] }
+aya = { workspace = true }
+aya-log = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+libc = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
+which = { workspace = true }
