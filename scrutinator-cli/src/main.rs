@@ -19,6 +19,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Profile a process — observe and produce a behavior summary
+    ///
+    /// Watches a PID (and its children) for a duration, then outputs
+    /// a structured behavior profile showing all files accessed,
+    /// network connections made, and child processes spawned.
+    Profile {
+        /// PID to profile
+        #[arg(long)]
+        pid: u32,
+
+        /// Observation duration in seconds (default: 30)
+        #[arg(long, default_value_t = 30)]
+        duration: u64,
+
+        /// Output format: json (default) or text
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+
     /// Watch process events in real-time
     ///
     /// Traces process execution (execve), forking, and exit events
@@ -52,6 +71,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Profile { pid, duration, format } => {
+            run_profile(pid, duration, &format).await
+        }
         Commands::Watch { pid, duration, json, files, network } => {
             run_watch(pid, duration, json, files, network).await
         }
@@ -163,6 +185,128 @@ async fn run_watch(
 
     observer_handle.abort();
     Ok(())
+}
+
+async fn run_profile(pid: u32, duration_secs: u64, format: &str) -> anyhow::Result<()> {
+    eprintln!("Loading eBPF programs...");
+
+    let mut observer = scrutinator::Observer::new()?;
+    observer.attach_process_tracing()?;
+    observer.attach_file_tracing()?;
+    observer.attach_network_tracing()?;
+
+    eprintln!(
+        "Profiling PID {} for {} seconds (all tracers active)...",
+        pid, duration_secs
+    );
+
+    let (tx, mut rx) = mpsc::channel::<ScrutEvent>(8192);
+    let mut profile_builder = scrutinator::ProfileBuilder::new(pid);
+
+    // Spawn observer
+    let observer_handle = tokio::spawn(async move {
+        if let Err(e) = observer.run(tx).await {
+            eprintln!("Observer error: {}", e);
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(duration_secs);
+
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                match event {
+                    Some(e) => profile_builder.add_event(&e),
+                    None => break,
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                eprintln!("Observation complete.");
+                break;
+            }
+        }
+    }
+
+    observer_handle.abort();
+
+    let profile = profile_builder.build();
+
+    match format {
+        "text" => print_profile_text(&profile),
+        _ => {
+            println!("{}", serde_json::to_string_pretty(&profile)?);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_profile_text(profile: &scrutinator::BehaviorProfile) {
+    println!("\n\x1b[1mBehavior Profile\x1b[0m");
+    println!("═══════════════════════════════════════");
+    println!("  PID:      {}", profile.pid);
+    println!("  Binary:   {}", profile.binary.as_deref().unwrap_or("(unknown)"));
+    println!("  Comm:     {}", profile.comm);
+    println!("  Duration: {:.1}s", profile.duration_secs);
+    println!("  Events:   {}", profile.total_events);
+
+    if !profile.files_read.is_empty() {
+        println!("\n\x1b[1mFiles Read\x1b[0m ({})", profile.files_read.len());
+        for f in &profile.files_read {
+            println!("  {}", f);
+        }
+    }
+
+    if !profile.files_written.is_empty() {
+        println!("\n\x1b[1mFiles Written\x1b[0m ({})", profile.files_written.len());
+        for f in &profile.files_written {
+            println!("  \x1b[33m{}\x1b[0m", f);
+        }
+    }
+
+    if !profile.files_created.is_empty() {
+        println!("\n\x1b[1mFiles Created\x1b[0m ({})", profile.files_created.len());
+        for f in &profile.files_created {
+            println!("  \x1b[32m{}\x1b[0m", f);
+        }
+    }
+
+    if !profile.files_deleted.is_empty() {
+        println!("\n\x1b[1mFiles Deleted\x1b[0m ({})", profile.files_deleted.len());
+        for f in &profile.files_deleted {
+            println!("  \x1b[91m{}\x1b[0m", f);
+        }
+    }
+
+    if !profile.sensitive_access.is_empty() {
+        println!("\n\x1b[91;1mSensitive Access\x1b[0m ({})", profile.sensitive_access.len());
+        for s in &profile.sensitive_access {
+            println!("  \x1b[91m{}\x1b[0m ({}) by {} [pid={}]", s.path, s.access_type, s.comm, s.pid);
+        }
+    }
+
+    if !profile.network_connections.is_empty() {
+        println!("\n\x1b[1mNetwork Connections\x1b[0m ({})", profile.network_connections.len());
+        for c in &profile.network_connections {
+            println!("  {}:{} ({}) by {}", c.addr, c.port, c.family, c.comm);
+        }
+    }
+
+    if !profile.ports_bound.is_empty() {
+        println!("\n\x1b[1mPorts Bound\x1b[0m ({})", profile.ports_bound.len());
+        for b in &profile.ports_bound {
+            println!("  {}:{} by {}", b.addr, b.port, b.comm);
+        }
+    }
+
+    if !profile.child_processes.is_empty() {
+        println!("\n\x1b[1mChild Processes\x1b[0m ({})", profile.child_processes.len());
+        for c in &profile.child_processes {
+            println!("  pid={} {} ({})", c.pid, c.binary, c.comm);
+        }
+    }
+
+    println!();
 }
 
 fn print_event(event: &ScrutEvent) {

@@ -23,6 +23,8 @@
 
 pub mod events;
 pub mod observer;
+pub mod profile;
 
 pub use events::ScrutEvent;
 pub use observer::Observer;
+pub use profile::{BehaviorProfile, ProfileBuilder};
