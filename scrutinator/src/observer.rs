@@ -116,6 +116,41 @@ impl Observer {
         Ok(())
     }
 
+    /// Attach network tracing programs (state changes, connect, bind)
+    pub fn attach_network_tracing(&mut self) -> anyhow::Result<()> {
+        // inet_sock_set_state — TCP state transitions
+        let state_prog: &mut TracePoint = self
+            .bpf
+            .program_mut("inet_sock_set_state")
+            .ok_or_else(|| anyhow::anyhow!("BPF program 'inet_sock_set_state' not found"))?
+            .try_into()?;
+        state_prog.load()?;
+        state_prog.attach("sock", "inet_sock_set_state")?;
+        info!("Attached inet_sock_set_state tracepoint");
+
+        // sys_enter_bind
+        let bind_prog: &mut TracePoint = self
+            .bpf
+            .program_mut("sys_enter_bind")
+            .ok_or_else(|| anyhow::anyhow!("BPF program 'sys_enter_bind' not found"))?
+            .try_into()?;
+        bind_prog.load()?;
+        bind_prog.attach("syscalls", "sys_enter_bind")?;
+        info!("Attached sys_enter_bind tracepoint");
+
+        // sys_enter_connect
+        let connect_prog: &mut TracePoint = self
+            .bpf
+            .program_mut("sys_enter_connect")
+            .ok_or_else(|| anyhow::anyhow!("BPF program 'sys_enter_connect' not found"))?
+            .try_into()?;
+        connect_prog.load()?;
+        connect_prog.attach("syscalls", "sys_enter_connect")?;
+        info!("Attached sys_enter_connect tracepoint");
+
+        Ok(())
+    }
+
     /// Run the observer, sending events to a channel
     pub async fn run(&mut self, tx: mpsc::Sender<ScrutEvent>) -> anyhow::Result<()> {
         let ring_buf = RingBuf::try_from(self.bpf.map_mut("EVENTS").unwrap())?;
@@ -203,6 +238,46 @@ impl Observer {
                                 &*(data.as_ptr() as *const scrutinator_common::FileRenameEvent)
                             };
                             Some(events::from_file_rename(raw))
+                        } else {
+                            None
+                        }
+                    }
+                    8 => {
+                        // NetConnect
+                        if data.len()
+                            >= core::mem::size_of::<scrutinator_common::NetConnectEvent>()
+                        {
+                            let raw = unsafe {
+                                &*(data.as_ptr() as *const scrutinator_common::NetConnectEvent)
+                            };
+                            Some(events::from_net_connect(raw))
+                        } else {
+                            None
+                        }
+                    }
+                    9 => {
+                        // NetBind
+                        if data.len()
+                            >= core::mem::size_of::<scrutinator_common::NetBindEvent>()
+                        {
+                            let raw = unsafe {
+                                &*(data.as_ptr() as *const scrutinator_common::NetBindEvent)
+                            };
+                            Some(events::from_net_bind(raw))
+                        } else {
+                            None
+                        }
+                    }
+                    10 => {
+                        // NetStateChange
+                        if data.len()
+                            >= core::mem::size_of::<scrutinator_common::NetStateChangeEvent>()
+                        {
+                            let raw = unsafe {
+                                &*(data.as_ptr()
+                                    as *const scrutinator_common::NetStateChangeEvent)
+                            };
+                            Some(events::from_net_state_change(raw))
                         } else {
                             None
                         }

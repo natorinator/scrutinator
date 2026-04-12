@@ -23,6 +23,9 @@ pub enum EventTag {
     FileClose = 5,
     FileDelete = 6,
     FileRename = 7,
+    NetConnect = 8,
+    NetBind = 9,
+    NetStateChange = 10,
 }
 
 /// Process execution event — emitted on sched_process_exec
@@ -135,6 +138,87 @@ pub struct FileRenameEvent {
     pub timestamp_ns: u64,
 }
 
+// --- Network events ---
+
+/// Address family constants
+pub mod af {
+    pub const AF_INET: u16 = 2;
+    pub const AF_INET6: u16 = 10;
+}
+
+/// TCP state constants (matching kernel values)
+pub mod tcp_state {
+    pub const TCP_ESTABLISHED: u32 = 1;
+    pub const TCP_SYN_SENT: u32 = 2;
+    pub const TCP_SYN_RECV: u32 = 3;
+    pub const TCP_FIN_WAIT1: u32 = 4;
+    pub const TCP_FIN_WAIT2: u32 = 5;
+    pub const TCP_TIME_WAIT: u32 = 6;
+    pub const TCP_CLOSE: u32 = 7;
+    pub const TCP_CLOSE_WAIT: u32 = 8;
+    pub const TCP_LAST_ACK: u32 = 9;
+    pub const TCP_LISTEN: u32 = 10;
+    pub const TCP_CLOSING: u32 = 11;
+}
+
+/// Network state change event — from inet_sock_set_state tracepoint
+///
+/// This is the primary network event. It fires on TCP state transitions
+/// and includes full source/dest address information.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetStateChangeEvent {
+    pub tag: EventTag,
+    pub pid: u32,
+    pub old_state: u32,
+    pub new_state: u32,
+    pub sport: u16,
+    pub dport: u16,
+    pub family: u16,
+    pub protocol: u16,
+    /// IPv4 source address (4 bytes, network byte order)
+    pub saddr: [u8; 4],
+    /// IPv4 dest address (4 bytes, network byte order)
+    pub daddr: [u8; 4],
+    /// IPv6 source address (16 bytes)
+    pub saddr_v6: [u8; 16],
+    /// IPv6 dest address (16 bytes)
+    pub daddr_v6: [u8; 16],
+    pub comm: [u8; MAX_COMM_LEN],
+    pub timestamp_ns: u64,
+}
+
+/// Network connect event — from sys_enter_connect
+///
+/// Captures the connect() syscall with destination address.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetConnectEvent {
+    pub tag: EventTag,
+    pub pid: u32,
+    pub family: u16,
+    pub port: u16,
+    /// IPv4 address or first 4 bytes of IPv6
+    pub addr: [u8; 4],
+    /// Full IPv6 address (zero for IPv4)
+    pub addr_v6: [u8; 16],
+    pub comm: [u8; MAX_COMM_LEN],
+    pub timestamp_ns: u64,
+}
+
+/// Network bind event — from sys_enter_bind
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NetBindEvent {
+    pub tag: EventTag,
+    pub pid: u32,
+    pub family: u16,
+    pub port: u16,
+    pub addr: [u8; 4],
+    pub comm: [u8; MAX_COMM_LEN],
+    pub timestamp_ns: u64,
+}
+
 #[cfg(feature = "user")]
 mod user_impls {
     use super::*;
@@ -220,10 +304,64 @@ mod user_impls {
                 .finish()
         }
     }
+
+    /// Format an IPv4 address from 4 bytes
+    pub fn format_ipv4(addr: &[u8; 4]) -> String {
+        format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3])
+    }
+
+    /// Format an IPv6 address from 16 bytes
+    pub fn format_ipv6(addr: &[u8; 16]) -> String {
+        let segments: Vec<String> = (0..8)
+            .map(|i| format!("{:x}", u16::from_be_bytes([addr[i * 2], addr[i * 2 + 1]])))
+            .collect();
+        segments.join(":")
+    }
+
+    /// Format an address based on family
+    pub fn format_addr(family: u16, v4: &[u8; 4], v6: &[u8; 16]) -> String {
+        if family == super::af::AF_INET6 {
+            format_ipv6(v6)
+        } else {
+            format_ipv4(v4)
+        }
+    }
+
+    impl core::fmt::Debug for NetStateChangeEvent {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("NetStateChangeEvent")
+                .field("pid", &self.pid)
+                .field("src", &format!("{}:{}", format_addr(self.family, &self.saddr, &self.saddr_v6), self.sport))
+                .field("dst", &format!("{}:{}", format_addr(self.family, &self.daddr, &self.daddr_v6), self.dport))
+                .field("old_state", &self.old_state)
+                .field("new_state", &self.new_state)
+                .finish()
+        }
+    }
+
+    impl core::fmt::Debug for NetConnectEvent {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("NetConnectEvent")
+                .field("pid", &self.pid)
+                .field("addr", &format!("{}:{}", format_addr(self.family, &self.addr, &self.addr_v6), self.port))
+                .field("comm", &bytes_to_string(&self.comm))
+                .finish()
+        }
+    }
+
+    impl core::fmt::Debug for NetBindEvent {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("NetBindEvent")
+                .field("pid", &self.pid)
+                .field("addr", &format!("{}:{}", format_ipv4(&self.addr), self.port))
+                .field("comm", &bytes_to_string(&self.comm))
+                .finish()
+        }
+    }
 }
 
 #[cfg(feature = "user")]
-pub use user_impls::bytes_to_string;
+pub use user_impls::{bytes_to_string, format_addr, format_ipv4, format_ipv6};
 
 #[cfg(test)]
 mod tests {
@@ -248,5 +386,15 @@ mod tests {
         assert_eq!(EventTag::FileClose as u32, 5);
         assert_eq!(EventTag::FileDelete as u32, 6);
         assert_eq!(EventTag::FileRename as u32, 7);
+        assert_eq!(EventTag::NetConnect as u32, 8);
+        assert_eq!(EventTag::NetBind as u32, 9);
+        assert_eq!(EventTag::NetStateChange as u32, 10);
+    }
+
+    #[test]
+    fn net_event_sizes() {
+        assert!(core::mem::size_of::<NetStateChangeEvent>() > 0);
+        assert!(core::mem::size_of::<NetConnectEvent>() > 0);
+        assert!(core::mem::size_of::<NetBindEvent>() > 0);
     }
 }

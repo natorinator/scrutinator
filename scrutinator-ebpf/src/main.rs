@@ -16,8 +16,8 @@ use aya_ebpf::{
     programs::TracePointContext,
 };
 use scrutinator_common::{
-    EventTag, FileDeleteEvent, FileOpenEvent, FileRenameEvent, ProcessExecEvent, ProcessExitEvent,
-    ProcessForkEvent, MAX_PATH_LEN,
+    EventTag, FileDeleteEvent, FileOpenEvent, FileRenameEvent, NetBindEvent, NetConnectEvent,
+    NetStateChangeEvent, ProcessExecEvent, ProcessExitEvent, ProcessForkEvent, MAX_PATH_LEN,
 };
 
 /// Ring buffer for delivering events to userspace
@@ -258,6 +258,202 @@ fn try_file_rename(ctx: &TracePointContext) -> Result<(), i64> {
                 newname_ptr as *const u8,
                 &mut (*ptr).new_path,
             );
+        }
+        buf.submit(0);
+    }
+
+    Ok(())
+}
+
+// --- Network tracing ---
+
+/// Tracepoint: sock/inet_sock_set_state
+///
+/// Fires on TCP state transitions. Provides full source/dest address info
+/// directly in the tracepoint args (no userspace pointer reading needed).
+#[tracepoint]
+pub fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
+    match try_net_state_change(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_net_state_change(ctx: &TracePointContext) -> Result<(), i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let comm = bpf_get_current_comm().map_err(|_| 1i64)?;
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    // inet_sock_set_state format:
+    // skaddr(8), oldstate(16), newstate(20), sport(24), dport(26),
+    // family(28), protocol(30), saddr(32), daddr(36), saddr_v6(40), daddr_v6(56)
+    let old_state: u32 = unsafe { ctx.read_at(16).unwrap_or(0) };
+    let new_state: u32 = unsafe { ctx.read_at(20).unwrap_or(0) };
+    let sport: u16 = unsafe { ctx.read_at(24).unwrap_or(0) };
+    let dport: u16 = unsafe { ctx.read_at(26).unwrap_or(0) };
+    let family: u16 = unsafe { ctx.read_at(28).unwrap_or(0) };
+    let protocol: u16 = unsafe { ctx.read_at(30).unwrap_or(0) };
+
+    if let Some(mut buf) = EVENTS.reserve::<NetStateChangeEvent>(0) {
+        let ptr = buf.as_mut_ptr() as *mut NetStateChangeEvent;
+        unsafe {
+            (*ptr).tag = EventTag::NetStateChange;
+            (*ptr).pid = pid;
+            (*ptr).old_state = old_state;
+            (*ptr).new_state = new_state;
+            (*ptr).sport = sport;
+            (*ptr).dport = dport;
+            (*ptr).family = family;
+            (*ptr).protocol = protocol;
+            (*ptr).comm = comm;
+            (*ptr).timestamp_ns = timestamp_ns;
+
+            // Read addresses from tracepoint context
+            (*ptr).saddr = [0u8; 4];
+            (*ptr).daddr = [0u8; 4];
+            (*ptr).saddr_v6 = [0u8; 16];
+            (*ptr).daddr_v6 = [0u8; 16];
+
+            // IPv4 addresses at offset 32 and 36
+            if let Ok(saddr) = ctx.read_at::<[u8; 4]>(32) {
+                (*ptr).saddr = saddr;
+            }
+            if let Ok(daddr) = ctx.read_at::<[u8; 4]>(36) {
+                (*ptr).daddr = daddr;
+            }
+            // IPv6 addresses at offset 40 and 56
+            if family == 10 {
+                // AF_INET6
+                if let Ok(saddr_v6) = ctx.read_at::<[u8; 16]>(40) {
+                    (*ptr).saddr_v6 = saddr_v6;
+                }
+                if let Ok(daddr_v6) = ctx.read_at::<[u8; 16]>(56) {
+                    (*ptr).daddr_v6 = daddr_v6;
+                }
+            }
+        }
+        buf.submit(0);
+    }
+
+    Ok(())
+}
+
+/// Tracepoint: syscalls/sys_enter_bind
+///
+/// Captures bind() calls to detect port binding / listening.
+#[tracepoint]
+pub fn sys_enter_bind(ctx: TracePointContext) -> u32 {
+    match try_net_bind(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_net_bind(ctx: &TracePointContext) -> Result<(), i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let comm = bpf_get_current_comm().map_err(|_| 1i64)?;
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    // sys_enter_bind: __syscall_nr(8), fd(16), umyaddr(24), addrlen(32)
+    let addr_ptr: u64 = unsafe { ctx.read_at(24).unwrap_or(0) };
+
+    if addr_ptr == 0 {
+        return Ok(());
+    }
+
+    // Read sockaddr_in from userspace: family(2 bytes), port(2 bytes), addr(4 bytes)
+    let mut sa_buf = [0u8; 8];
+    unsafe {
+        let _ = aya_ebpf::helpers::bpf_probe_read_user_buf(addr_ptr as *const u8, &mut sa_buf);
+    }
+
+    let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
+    let port = u16::from_be_bytes([sa_buf[2], sa_buf[3]]);
+    let addr = [sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]];
+
+    if let Some(mut buf) = EVENTS.reserve::<NetBindEvent>(0) {
+        let ptr = buf.as_mut_ptr() as *mut NetBindEvent;
+        unsafe {
+            (*ptr).tag = EventTag::NetBind;
+            (*ptr).pid = pid;
+            (*ptr).family = family;
+            (*ptr).port = port;
+            (*ptr).addr = addr;
+            (*ptr).comm = comm;
+            (*ptr).timestamp_ns = timestamp_ns;
+        }
+        buf.submit(0);
+    }
+
+    Ok(())
+}
+
+/// Tracepoint: syscalls/sys_enter_connect
+///
+/// Captures connect() calls with destination address.
+#[tracepoint]
+pub fn sys_enter_connect(ctx: TracePointContext) -> u32 {
+    match try_net_connect(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn try_net_connect(ctx: &TracePointContext) -> Result<(), i64> {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = (pid_tgid >> 32) as u32;
+    let comm = bpf_get_current_comm().map_err(|_| 1i64)?;
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    // sys_enter_connect: __syscall_nr(8), fd(16), uservaddr(24), addrlen(32)
+    let addr_ptr: u64 = unsafe { ctx.read_at(24).unwrap_or(0) };
+    let addrlen: u64 = unsafe { ctx.read_at(32).unwrap_or(0) };
+
+    if addr_ptr == 0 {
+        return Ok(());
+    }
+
+    // Read sockaddr from userspace
+    // sockaddr_in: family(2), port(2), addr(4)
+    // sockaddr_in6: family(2), port(2), flowinfo(4), addr(16)
+    let mut sa_buf = [0u8; 28]; // enough for sockaddr_in6
+    let read_len = if addrlen > 28 { 28 } else { addrlen as usize };
+    unsafe {
+        let _ = aya_ebpf::helpers::bpf_probe_read_user_buf(
+            addr_ptr as *const u8,
+            &mut sa_buf[..read_len],
+        );
+    }
+
+    let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
+    let port = u16::from_be_bytes([sa_buf[2], sa_buf[3]]);
+    let addr = [sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]];
+
+    // Read IPv6 address if AF_INET6
+    let mut addr_v6 = [0u8; 16];
+    if family == 10 && read_len >= 24 {
+        // sockaddr_in6: addr starts at offset 8 (after family + port + flowinfo)
+        addr_v6.copy_from_slice(&sa_buf[8..24]);
+    }
+
+    // Skip AF_UNIX and other non-IP families
+    if family != 2 && family != 10 {
+        return Ok(());
+    }
+
+    if let Some(mut buf) = EVENTS.reserve::<NetConnectEvent>(0) {
+        let ptr = buf.as_mut_ptr() as *mut NetConnectEvent;
+        unsafe {
+            (*ptr).tag = EventTag::NetConnect;
+            (*ptr).pid = pid;
+            (*ptr).family = family;
+            (*ptr).port = port;
+            (*ptr).addr = addr;
+            (*ptr).addr_v6 = addr_v6;
+            (*ptr).comm = comm;
+            (*ptr).timestamp_ns = timestamp_ns;
         }
         buf.submit(0);
     }

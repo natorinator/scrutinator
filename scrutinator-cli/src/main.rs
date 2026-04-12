@@ -39,6 +39,10 @@ enum Commands {
         /// Also trace file access (open, delete, rename)
         #[arg(long)]
         files: bool,
+
+        /// Also trace network activity (connect, bind, TCP state)
+        #[arg(long)]
+        network: bool,
     },
 }
 
@@ -48,8 +52,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Watch { pid, duration, json, files } => {
-            run_watch(pid, duration, json, files).await
+        Commands::Watch { pid, duration, json, files, network } => {
+            run_watch(pid, duration, json, files, network).await
         }
     }
 }
@@ -59,6 +63,7 @@ async fn run_watch(
     duration_secs: Option<u64>,
     json_output: bool,
     trace_files: bool,
+    trace_network: bool,
 ) -> anyhow::Result<()> {
     eprintln!("Loading eBPF programs...");
 
@@ -70,7 +75,12 @@ async fn run_watch(
         eprintln!("File tracing enabled (open, delete, rename)");
     }
 
-    eprintln!("Watching process events (Ctrl-C to stop)...");
+    if trace_network {
+        observer.attach_network_tracing()?;
+        eprintln!("Network tracing enabled (connect, bind, TCP state)");
+    }
+
+    eprintln!("Watching events (Ctrl-C to stop)...");
     if let Some(pid) = filter_pid {
         eprintln!("Filtering to PID {} and descendants", pid);
     }
@@ -131,7 +141,10 @@ async fn run_watch(
                 ScrutEvent::ProcessExit { pid, .. } => tracked_pids.contains(pid),
                 ScrutEvent::FileOpen { pid, .. }
                 | ScrutEvent::FileDelete { pid, .. }
-                | ScrutEvent::FileRename { pid, .. } => tracked_pids.contains(pid),
+                | ScrutEvent::FileRename { pid, .. }
+                | ScrutEvent::NetStateChange { pid, .. }
+                | ScrutEvent::NetConnect { pid, .. }
+                | ScrutEvent::NetBind { pid, .. } => tracked_pids.contains(pid),
             };
 
             if !dominated {
@@ -238,6 +251,58 @@ fn print_event(event: &ScrutEvent) {
             println!(
                 "\x1b[32m{}\x1b[0m  \x1b[33mRENAME\x1b[0m pid={} comm={} {} -> {}",
                 time, pid, comm, old_path, new_path
+            );
+        }
+        ScrutEvent::NetStateChange {
+            pid,
+            comm,
+            src_addr,
+            src_port,
+            dst_addr,
+            dst_port,
+            old_state,
+            new_state,
+            family,
+            timestamp,
+        } => {
+            let time = timestamp.format("%H:%M:%S%.3f");
+            let color = match new_state.as_str() {
+                "ESTABLISHED" => "32",
+                "CLOSE" | "TIME_WAIT" => "37",
+                "SYN_SENT" => "33",
+                _ => "36",
+            };
+            println!(
+                "\x1b[32m{}\x1b[0m  \x1b[{}mTCP\x1b[0m    pid={} comm={} {}:{} -> {}:{} {} [{}->{}]",
+                time, color, pid, comm, src_addr, src_port, dst_addr, dst_port,
+                family, old_state, new_state
+            );
+        }
+        ScrutEvent::NetConnect {
+            pid,
+            comm,
+            addr,
+            port,
+            family,
+            timestamp,
+        } => {
+            let time = timestamp.format("%H:%M:%S%.3f");
+            println!(
+                "\x1b[32m{}\x1b[0m  \x1b[35mCONN\x1b[0m   pid={} comm={} -> {}:{} ({})",
+                time, pid, comm, addr, port, family
+            );
+        }
+        ScrutEvent::NetBind {
+            pid,
+            comm,
+            addr,
+            port,
+            timestamp,
+        } => {
+            let time = timestamp.format("%H:%M:%S%.3f");
+            println!(
+                "\x1b[32m{}\x1b[0m  \x1b[34mBIND\x1b[0m   pid={} comm={} {}:{}",
+                time, pid, comm, addr, port
             );
         }
     }
