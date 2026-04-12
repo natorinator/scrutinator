@@ -35,6 +35,10 @@ enum Commands {
         /// Output as JSON (one event per line)
         #[arg(long)]
         json: bool,
+
+        /// Also trace file access (open, delete, rename)
+        #[arg(long)]
+        files: bool,
     },
 }
 
@@ -44,8 +48,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Watch { pid, duration, json } => {
-            run_watch(pid, duration, json).await
+        Commands::Watch { pid, duration, json, files } => {
+            run_watch(pid, duration, json, files).await
         }
     }
 }
@@ -54,11 +58,17 @@ async fn run_watch(
     filter_pid: Option<u32>,
     duration_secs: Option<u64>,
     json_output: bool,
+    trace_files: bool,
 ) -> anyhow::Result<()> {
     eprintln!("Loading eBPF programs...");
 
     let mut observer = scrutinator::Observer::new()?;
     observer.attach_process_tracing()?;
+
+    if trace_files {
+        observer.attach_file_tracing()?;
+        eprintln!("File tracing enabled (open, delete, rename)");
+    }
 
     eprintln!("Watching process events (Ctrl-C to stop)...");
     if let Some(pid) = filter_pid {
@@ -119,6 +129,9 @@ async fn run_watch(
                     }
                 }
                 ScrutEvent::ProcessExit { pid, .. } => tracked_pids.contains(pid),
+                ScrutEvent::FileOpen { pid, .. }
+                | ScrutEvent::FileDelete { pid, .. }
+                | ScrutEvent::FileRename { pid, .. } => tracked_pids.contains(pid),
             };
 
             if !dominated {
@@ -177,6 +190,54 @@ fn print_event(event: &ScrutEvent) {
             println!(
                 "\x1b[32m{}\x1b[0m  \x1b[{}mEXIT\x1b[0m  pid={} code={} comm={}",
                 time, color, pid, exit_code, comm
+            );
+        }
+        ScrutEvent::FileOpen {
+            pid,
+            comm,
+            path,
+            writable,
+            created,
+            timestamp,
+            ..
+        } => {
+            let time = timestamp.format("%H:%M:%S%.3f");
+            let mode = if *created {
+                "CREATE"
+            } else if *writable {
+                "WRITE"
+            } else {
+                "READ"
+            };
+            let color = if *writable || *created { "33" } else { "37" };
+            println!(
+                "\x1b[32m{}\x1b[0m  \x1b[{}mOPEN\x1b[0m   pid={} mode={} comm={} path={}",
+                time, color, pid, mode, comm, path
+            );
+        }
+        ScrutEvent::FileDelete {
+            pid,
+            comm,
+            path,
+            timestamp,
+        } => {
+            let time = timestamp.format("%H:%M:%S%.3f");
+            println!(
+                "\x1b[32m{}\x1b[0m  \x1b[91mDEL\x1b[0m    pid={} comm={} path={}",
+                time, pid, comm, path
+            );
+        }
+        ScrutEvent::FileRename {
+            pid,
+            comm,
+            old_path,
+            new_path,
+            timestamp,
+        } => {
+            let time = timestamp.format("%H:%M:%S%.3f");
+            println!(
+                "\x1b[32m{}\x1b[0m  \x1b[33mRENAME\x1b[0m pid={} comm={} {} -> {}",
+                time, pid, comm, old_path, new_path
             );
         }
     }

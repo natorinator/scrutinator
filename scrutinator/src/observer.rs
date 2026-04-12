@@ -81,6 +81,41 @@ impl Observer {
         Ok(())
     }
 
+    /// Attach file access tracing programs (open, delete, rename)
+    pub fn attach_file_tracing(&mut self) -> anyhow::Result<()> {
+        // sys_enter_openat
+        let open_prog: &mut TracePoint = self
+            .bpf
+            .program_mut("sys_enter_openat")
+            .ok_or_else(|| anyhow::anyhow!("BPF program 'sys_enter_openat' not found"))?
+            .try_into()?;
+        open_prog.load()?;
+        open_prog.attach("syscalls", "sys_enter_openat")?;
+        info!("Attached sys_enter_openat tracepoint");
+
+        // sys_enter_unlinkat
+        let unlink_prog: &mut TracePoint = self
+            .bpf
+            .program_mut("sys_enter_unlinkat")
+            .ok_or_else(|| anyhow::anyhow!("BPF program 'sys_enter_unlinkat' not found"))?
+            .try_into()?;
+        unlink_prog.load()?;
+        unlink_prog.attach("syscalls", "sys_enter_unlinkat")?;
+        info!("Attached sys_enter_unlinkat tracepoint");
+
+        // sys_enter_renameat2
+        let rename_prog: &mut TracePoint = self
+            .bpf
+            .program_mut("sys_enter_renameat2")
+            .ok_or_else(|| anyhow::anyhow!("BPF program 'sys_enter_renameat2' not found"))?
+            .try_into()?;
+        rename_prog.load()?;
+        rename_prog.attach("syscalls", "sys_enter_renameat2")?;
+        info!("Attached sys_enter_renameat2 tracepoint");
+
+        Ok(())
+    }
+
     /// Run the observer, sending events to a channel
     pub async fn run(&mut self, tx: mpsc::Sender<ScrutEvent>) -> anyhow::Result<()> {
         let ring_buf = RingBuf::try_from(self.bpf.map_mut("EVENTS").unwrap())?;
@@ -133,6 +168,41 @@ impl Observer {
                                     as *const scrutinator_common::ProcessExitEvent)
                             };
                             Some(events::from_exit(raw))
+                        } else {
+                            None
+                        }
+                    }
+                    4 => {
+                        // FileOpen
+                        if data.len() >= core::mem::size_of::<scrutinator_common::FileOpenEvent>() {
+                            let raw = unsafe {
+                                &*(data.as_ptr() as *const scrutinator_common::FileOpenEvent)
+                            };
+                            Some(events::from_file_open(raw))
+                        } else {
+                            None
+                        }
+                    }
+                    6 => {
+                        // FileDelete
+                        if data.len() >= core::mem::size_of::<scrutinator_common::FileDeleteEvent>()
+                        {
+                            let raw = unsafe {
+                                &*(data.as_ptr() as *const scrutinator_common::FileDeleteEvent)
+                            };
+                            Some(events::from_file_delete(raw))
+                        } else {
+                            None
+                        }
+                    }
+                    7 => {
+                        // FileRename
+                        if data.len() >= core::mem::size_of::<scrutinator_common::FileRenameEvent>()
+                        {
+                            let raw = unsafe {
+                                &*(data.as_ptr() as *const scrutinator_common::FileRenameEvent)
+                            };
+                            Some(events::from_file_rename(raw))
                         } else {
                             None
                         }
