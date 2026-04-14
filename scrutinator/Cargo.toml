@@ -3,6 +3,7 @@ name = "scrutinator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "eBPF system observation library — process, file, and network tracing"
 
 [dependencies]
