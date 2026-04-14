@@ -11,7 +11,7 @@ name = "scrutinator"
 path = "src/main.rs"
 
 [dependencies]
-scrutinator = { path = "../scrutinator" }
+scrutinator = { path = "../scrutinator", version = "0.1.0" }
 scrutinator-common = { workspace = true, features = ["user"] }
 tokio = { workspace = true }
 clap = { workspace = true }

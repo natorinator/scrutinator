@@ -46,7 +46,7 @@ cargo_metadata = "0.19"
 which = "7"
 
 # Internal
-scrutinator-common = { path = "scrutinator-common" }
+scrutinator-common = { path = "scrutinator-common", version = "0.1.0" }
 
 [profile.release]
 opt-level = 3

@@ -3,12 +3,33 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let ebpf_dir = manifest_dir.parent().unwrap().join("scrutinator-ebpf");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let ebpf_dir = manifest_dir.parent().unwrap().join("scrutinator-ebpf");
 
-    println!("cargo:rerun-if-changed={}", ebpf_dir.display());
+    // This is the path that observer.rs expects via include_bytes_aligned!
+    let expected_binary = out_dir.join("scrutinator-ebpf/bpfel-unknown-none/release/scrutinator");
 
-    // Build eBPF programs using nightly toolchain
+    // If the eBPF source tree exists (workspace development), build from source
+    if ebpf_dir.join("Cargo.toml").exists() {
+        println!("cargo:rerun-if-changed={}", ebpf_dir.display());
+        build_ebpf_from_source(&ebpf_dir, &out_dir);
+    } else {
+        // crates.io install — use the pre-compiled binary
+        let bundled = manifest_dir.join("bpf/scrutinator.bin");
+        if !bundled.exists() {
+            panic!(
+                "No eBPF source tree and no pre-compiled binary found at {}",
+                bundled.display()
+            );
+        }
+
+        std::fs::create_dir_all(expected_binary.parent().unwrap()).unwrap();
+        std::fs::copy(&bundled, &expected_binary).unwrap();
+        println!("cargo:warning=Using pre-compiled eBPF binary from bpf/scrutinator.bin");
+    }
+}
+
+fn build_ebpf_from_source(ebpf_dir: &PathBuf, out_dir: &PathBuf) {
     let target_dir = out_dir.join("scrutinator-ebpf");
 
     let status = Command::new("rustup")
